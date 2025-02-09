@@ -16,28 +16,27 @@ from PyQt5.QtGui import QDesktopServices
 class CrawlerWorker(QtCore.QThread):
     # Signals to communicate with the main GUI thread.
     log_signal = QtCore.pyqtSignal(str)
-    # website, emails set, mobiles set
-    website_done_signal = QtCore.pyqtSignal(str, set, set)
+    website_done_signal = QtCore.pyqtSignal(str, set, set)  # website, emails set, mobiles set
     finished_signal = QtCore.pyqtSignal()
 
-    def __init__(self, websites, max_pages=100, max_depth=0, parent=None):
+    def __init__(self, websites, max_pages=100, max_depth=0, dynamic_crawl=False, parent=None):
         """
         :param websites: List of starting website URLs.
         :param max_pages: Maximum number of pages to visit per website (0 for unlimited).
         :param max_depth: Maximum depth for crawling links (0 for unlimited).
+        :param dynamic_crawl: If True, use dynamic crawling (Playwright) for all pages.
         """
         super().__init__(parent)
         self.websites = websites
         self.max_pages = max_pages
         self.max_depth = max_depth  # 0 means no depth limit
+        self.dynamic_crawl = dynamic_crawl
         self.stop_requested = False
         self.email_regex = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
-        # Regex for Italian mobile phone numbers:
-        # Matches formats such as: +39 331 1234567, 0039-331-1234567, or just 3311234567.
+        # Regex for Italian mobile phone numbers (adjust as needed)
         self.mobile_regex = re.compile(
             r'\b(?:\+39[-\s]?|0039[-\s]?|0)?3\d{2}[-\s]?\d{3}[-\s]?\d{4}\b'
         )
-        # Define headers to mimic a regular browser.
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -48,26 +47,20 @@ class CrawlerWorker(QtCore.QThread):
         }
 
     def normalize_url(self, url):
-        """
-        Remove the fragment part and lowercase the domain.
-        IMPORTANT: Do not remove the 'www.' as some sites require it.
-        """
+        """Remove the fragment part and lowercase the domain."""
         parsed = urlparse(url)
-        netloc = parsed.netloc.lower()  # lowercase the domain
-        normalized = parsed._replace(netloc=netloc, fragment="")  # remove fragment only
+        netloc = parsed.netloc.lower()
+        normalized = parsed._replace(netloc=netloc, fragment="")
         return normalized.geturl()
 
     def normalize_phone(self, phone):
         """
         Normalize Italian mobile numbers so that different formats become identical.
-        The normalization removes spaces, dashes, and ensures a leading "+39".
+        Removes spaces, dashes, and ensures a leading "+39".
         """
-        # Remove common separators: spaces, dashes, parentheses.
         phone = re.sub(r'[\s\-\(\)]+', '', phone)
-        # Replace 0039 with +39 if present.
         if phone.startswith("0039"):
             phone = "+39" + phone[4:]
-        # If it doesn't start with +39, check if it starts with "0" (e.g. 0331...) and replace.
         if not phone.startswith("+39"):
             if phone.startswith("0"):
                 phone = "+39" + phone[1:]
@@ -76,14 +69,12 @@ class CrawlerWorker(QtCore.QThread):
         return phone
 
     def run(self):
-        # Process each website provided.
         for website in self.websites:
             if self.stop_requested:
                 self.log_signal.emit("Crawling stopped by user.")
                 break
 
             website = website.strip()
-            # If protocol is missing, try https first.
             if not website.startswith("http"):
                 website = "https://" + website
 
@@ -96,17 +87,20 @@ class CrawlerWorker(QtCore.QThread):
                 f"Completed {website}: Found {len(emails)} email(s) and {len(mobiles)} mobile number(s). "
                 f"Emails: {email_list} | Mobiles: {mobile_list}"
             )
-
         self.finished_signal.emit()
 
     def crawl_website(self, base_url):
         visited = set()
         emails_found = set()
         mobiles_found = set()
-        # The queue holds tuples of (url, current_depth)
         queue = [(base_url, 0)]
-        # Normalize the base domain for internal link checks.
         base_domain = urlparse(self.normalize_url(base_url)).netloc
+
+        # If dynamic crawling is forced, launch Playwright.
+        if self.dynamic_crawl:
+            from playwright.sync_api import sync_playwright
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(headless=True)
 
         while queue:
             if self.stop_requested:
@@ -117,7 +111,6 @@ class CrawlerWorker(QtCore.QThread):
             if normalized_current in visited:
                 continue
 
-            # Check maximum pages limit if set (nonzero).
             if self.max_pages and len(visited) >= self.max_pages:
                 self.log_signal.emit("Reached maximum page limit.")
                 break
@@ -126,42 +119,73 @@ class CrawlerWorker(QtCore.QThread):
             self.log_signal.emit(f"Visiting: {normalized_current}")
 
             try:
-                response = requests.get(normalized_current, timeout=10, headers=self.headers)
-                if response.status_code != 200:
-                    self.log_signal.emit(
-                        f"Failed to retrieve {normalized_current} (Status Code: {response.status_code})"
-                    )
-                    continue
+                if self.dynamic_crawl:
+                    page = browser.new_page()
+                    page.goto(normalized_current, wait_until="networkidle")
+                    content = page.content()
+                    page.close()
+                else:
+                    response = requests.get(normalized_current, timeout=10, headers=self.headers)
+                    if response.status_code != 200:
+                        self.log_signal.emit(
+                            f"Failed to retrieve {normalized_current} (Status Code: {response.status_code})"
+                        )
+                        continue
+                    content = response.text
 
-                content = response.text
-                # Extract emails.
+                # Extract emails and mobile numbers.
                 found_emails = self.email_regex.findall(content)
                 emails_found.update(found_emails)
-                # Extract Italian mobile phone numbers and normalize them.
                 found_mobiles = self.mobile_regex.findall(content)
                 normalized_mobiles = set(self.normalize_phone(m) for m in found_mobiles)
                 mobiles_found.update(normalized_mobiles)
 
+                # Follow internal links.
                 soup = BeautifulSoup(content, "html.parser")
                 for a in soup.find_all('a', href=True):
                     href = a['href'].strip()
-                    # Skip links that are just hash anchors.
                     if href.startswith("#"):
                         continue
-
                     absolute_url = urljoin(normalized_current, href)
                     normalized_link = self.normalize_url(absolute_url)
                     link_domain = urlparse(normalized_link).netloc
-
-                    # Only follow links within the same domain.
                     if link_domain == base_domain and normalized_link not in visited:
-                        # If max_depth is 0, there's no depth limit; otherwise, only add if current_depth < max_depth.
                         if self.max_depth == 0 or current_depth < self.max_depth:
                             queue.append((normalized_link, current_depth + 1))
                 time.sleep(1)  # Polite delay
 
             except Exception as e:
                 self.log_signal.emit(f"Error accessing {normalized_current}: {e}")
+
+        # If static crawl (not forced dynamic) returned insufficient data, try a dynamic fallback.
+        if not self.dynamic_crawl and (len(emails_found) == 0 or len(mobiles_found) == 0):
+            self.log_signal.emit("Static crawling yielded insufficient data; trying dynamic fallback on base URL.")
+            try:
+                from playwright.sync_api import sync_playwright
+                playwright = sync_playwright().start()
+                browser_dynamic = playwright.chromium.launch(headless=True)
+                page = browser_dynamic.new_page()
+                page.goto(base_url, wait_until="networkidle")
+                dynamic_content = page.content()
+                page.close()
+                browser_dynamic.close()
+                playwright.stop()
+
+                dynamic_emails = set(self.email_regex.findall(dynamic_content))
+                dynamic_mobiles = set(self.normalize_phone(m) for m in self.mobile_regex.findall(dynamic_content))
+                if dynamic_emails:
+                    emails_found.update(dynamic_emails)
+                if dynamic_mobiles:
+                    mobiles_found.update(dynamic_mobiles)
+                self.log_signal.emit(
+                    f"Dynamic fallback added {len(dynamic_emails)} email(s) and {len(dynamic_mobiles)} mobile number(s)."
+                )
+            except Exception as e:
+                self.log_signal.emit(f"Dynamic fallback failed: {e}")
+
+        if self.dynamic_crawl:
+            browser.close()
+            playwright.stop()
 
         return emails_found, mobiles_found
 
@@ -174,11 +198,10 @@ class CrawlerWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Advanced Email & Mobile Number Crawler")
+        self.setWindowTitle("EnP - Advanced Email & Mobile Number Crawler")
         self.resize(1100, 800)
         self.websites = []  # List to hold website URLs.
-        # results: {website: (emails set, mobiles set)}
-        self.results = {}
+        self.results = {}   # Dictionary: {website: (emails set, mobiles set)}
         self.worker = None
         self.start_time = None
 
@@ -211,25 +234,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_button.clicked.connect(self.export_results)
         control_layout.addWidget(self.export_button)
 
-        # Bulk Email Button
         self.bulk_email_button = QtWidgets.QPushButton("Send Bulk Email")
         self.bulk_email_button.setEnabled(False)
         self.bulk_email_button.clicked.connect(self.send_bulk_email)
         control_layout.addWidget(self.bulk_email_button)
 
-        # Indeterminate progress bar (visible during crawling)
+        # Checkbox to force dynamic crawling. If unchecked, auto fallback is enabled.
+        self.dynamic_checkbox = QtWidgets.QCheckBox("Force Dynamic Crawling (JS)")
+        control_layout.addWidget(self.dynamic_checkbox)
+
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         control_layout.addWidget(self.progress_bar)
 
-        # Timer label for elapsed time
         self.timer_label = QtWidgets.QLabel("Elapsed Time: 00:00:00")
         control_layout.addWidget(self.timer_label)
 
         main_layout.addLayout(control_layout)
 
-        # --- Manual Website Input ---
+        # --- Manual Website Input and Removal ---
         manual_layout = QtWidgets.QHBoxLayout()
         manual_label = QtWidgets.QLabel("Add Website Manually:")
         manual_layout.addWidget(manual_label)
@@ -239,10 +263,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.add_button = QtWidgets.QPushButton("Add Website")
         self.add_button.clicked.connect(self.add_website_manually)
         manual_layout.addWidget(self.add_button)
+        self.remove_button = QtWidgets.QPushButton("Remove Selected Website")
+        self.remove_button.clicked.connect(self.remove_selected_website)
+        manual_layout.addWidget(self.remove_button)
         main_layout.addLayout(manual_layout)
 
         # --- Table to Display Website Results ---
-        # The table now has an extra column for WhatsApp links.
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["Website", "Email Count", "Emails", "Mobile Numbers", "WhatsApp Links"])
@@ -260,54 +286,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self.credit_label.setStyleSheet("color: blue; font-weight: bold;")
         main_layout.addWidget(self.credit_label)
 
-        # Timer for updating elapsed time during crawling
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_timer)
 
     def add_website_manually(self):
-        """Add a website entered manually to the list and update the table."""
         url = self.website_input.text().strip()
         if not url:
             QtWidgets.QMessageBox.warning(self, "Input Error", "Please enter a website URL.")
             return
-
-        # If the URL doesn't start with http, prepend "https://"
         if not url.startswith("http"):
             url = "https://" + url
-
-        # Basic validation using urlparse.
         parsed = urlparse(url)
         if not parsed.netloc:
             QtWidgets.QMessageBox.warning(self, "Input Error", "The entered URL is not valid.")
             return
-
-        # Add the website to the list if not already present.
         if url in self.websites:
             QtWidgets.QMessageBox.information(self, "Duplicate", "This website is already added.")
             self.website_input.clear()
             return
-
         self.websites.append(url)
         self.log(f"Manually added website: {url}")
-
-        # Update the table with a new row.
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(url))
         self.table.setItem(row, 1, QtWidgets.QTableWidgetItem("0"))
         self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
         self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(""))
-        # Leave the WhatsApp links cell blank initially.
         self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(""))
-
-        # Clear the input field.
         self.website_input.clear()
-
-        # Enable the "Start Crawling" button if at least one website is present.
         if self.websites:
             self.start_button.setEnabled(True)
 
-    # ----------------- File Loading & URL Detection -----------------
+    def remove_selected_website(self):
+        selected_rows = set()
+        for item in self.table.selectedItems():
+            selected_rows.add(item.row())
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Remove Website", "Please select a website to remove.")
+            return
+        for row in sorted(selected_rows, reverse=True):
+            website_item = self.table.item(row, 0)
+            if website_item:
+                website = website_item.text().strip()
+                if website in self.websites:
+                    self.websites.remove(website)
+                if website in self.results:
+                    del self.results[website]
+            self.table.removeRow(row)
+        self.log("Selected website(s) removed.")
+
     def load_excel(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Excel File", "", "Excel Files (*.xlsx *.xls)"
@@ -345,14 +372,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 new_websites = df[detected_col].dropna().astype(str).tolist()
                 self.log(f"Loaded {len(new_websites)} website(s) from column '{detected_col}'.")
-                # Add new websites (avoiding duplicates).
                 for website in new_websites:
                     website = website.strip()
                     if not website.startswith("http"):
                         website = "https://" + website
                     if website not in self.websites:
                         self.websites.append(website)
-                        # Update table.
                         row = self.table.rowCount()
                         self.table.insertRow(row)
                         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(website))
@@ -364,25 +389,33 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load Excel file: {e}")
 
-    # ----------------- Crawling Controls -----------------
     def start_crawling(self):
         if not self.websites:
             QtWidgets.QMessageBox.warning(self, "Warning", "No websites loaded.")
             return
 
-        self.results = {}
-        self.log("Starting crawling process...")
+        # Only crawl new websites (skip already crawled ones).
+        new_sites = [site for site in self.websites if site not in self.results]
+        if not new_sites:
+            QtWidgets.QMessageBox.information(self, "Information", "All websites have already been crawled.")
+            return
+
+        self.log("Starting crawling process for new websites...")
+        # Do not clear self.results; preserve previous results.
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.export_button.setEnabled(False)
         self.bulk_email_button.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.timer.start(1000)  # Update timer every second
+        self.timer.start(1000)
         self.start_time = time.time()
 
-        # Adjust max_pages and max_depth as needed.
-        # Set max_depth=0 for unlimited depth.
-        self.worker = CrawlerWorker(self.websites, max_pages=100, max_depth=0)
+        self.worker = CrawlerWorker(
+            new_sites,
+            max_pages=100,
+            max_depth=0,
+            dynamic_crawl=self.dynamic_checkbox.isChecked()
+        )
         self.worker.log_signal.connect(self.log)
         self.worker.website_done_signal.connect(self.update_table)
         self.worker.finished_signal.connect(self.crawling_finished)
@@ -404,30 +437,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.stop()
 
     def get_whatsapp_link(self, phone):
-        """
-        Create a WhatsApp link from a normalized phone number.
-        Assumes phone is normalized to start with "+39" (or similar).
-        The WhatsApp URL should not include the '+'.
-        """
+        """Create a WhatsApp link from a normalized phone number."""
         if phone.startswith("+"):
             return f"https://wa.me/{phone[1:]}"
         return f"https://wa.me/{phone}"
 
-    # ----------------- Table & Logging -----------------
     def update_table(self, website, emails, mobiles):
         self.results[website] = (emails, mobiles)
-        # Compute WhatsApp links for each mobile.
         wa_links = [self.get_whatsapp_link(m) for m in mobiles]
-        # Update the row corresponding to the website.
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).text().strip() == website:
                 email_count = len(emails)
                 self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(email_count)))
                 self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(", ".join(emails)))
                 self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(", ".join(mobiles)))
-                # Instead of a plain text cell, create a QLabel with clickable WhatsApp links.
+                # Create a QLabel with clickable WhatsApp links (each on a new line)
                 wa_html = ""
-                # Create each link on a separate line.
                 for m in sorted(mobiles):
                     url = self.get_whatsapp_link(m)
                     wa_html += f'<a href="{url}">{m}</a><br>'
@@ -465,17 +490,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to export results: {e}")
 
     def send_bulk_email(self):
-        """
-        Collect all unique emails from the results and open a mailto: link
-        so that the default email client is opened with all addresses.
-        """
         all_emails = set()
         for emails, _ in self.results.values():
             all_emails.update(emails)
         if not all_emails:
             QtWidgets.QMessageBox.information(self, "No Emails", "No email addresses available to send.")
             return
-        # Create a mailto: link with comma-separated emails.
         mailto_link = "mailto:" + ",".join(all_emails)
         QDesktopServices.openUrl(QUrl(mailto_link))
 
