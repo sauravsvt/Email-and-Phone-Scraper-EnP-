@@ -1,5 +1,5 @@
 # Email-and-Phone-Scraper-EnP-
-It extracts email addresses and Italian mobile phone numbers from websites, normalizes and deduplicates them, and then displays the results in an intuitive GUI
+It extracts email addresses and any country mobile phone numbers from websites, normalizes and deduplicates them, and then displays the results in an intuitive GUI
 
 **EnP**
 EnP is an advanced web crawler application built with Python and PyQt5. It extracts email addresses and Italian mobile phone numbers from websites, normalizes and deduplicates them, and then displays the results in an intuitive GUI. With clickable WhatsApp links for each mobile number and bulk email functionality, EnP makes it easy to contact your leads—all in one app.
