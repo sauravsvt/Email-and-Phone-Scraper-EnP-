@@ -356,7 +356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(self.log_text)
 
         # --- Credits ---
-        self.credit_label = QtWidgets.QLabel("Concept and development by ChatGPT and Saurav Shriwastav")
+        self.credit_label = QtWidgets.QLabel("Concept and development by Saurav Shriwastav")
         self.credit_label.setAlignment(QtCore.Qt.AlignCenter)
         self.credit_label.setStyleSheet("color: blue; font-weight: bold;")
         main_layout.addWidget(self.credit_label)
