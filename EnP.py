@@ -10,6 +10,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QUrl
 from PyQt5.QtGui import QDesktopServices
 
+# Ensure you have installed phonenumbers: pip install phonenumbers
+import phonenumbers
+from phonenumbers import PhoneNumberMatcher, PhoneNumberFormat, number_type, PhoneNumberType
+
 # ------------------------------------------------------------------------------
 # Worker Thread for Crawling
 # ------------------------------------------------------------------------------
@@ -19,24 +23,27 @@ class CrawlerWorker(QtCore.QThread):
     website_done_signal = QtCore.pyqtSignal(str, set, set)  # website, emails set, mobiles set
     finished_signal = QtCore.pyqtSignal()
 
-    def __init__(self, websites, max_pages=100, max_depth=0, dynamic_crawl=False, parent=None):
+    def __init__(self, websites, max_pages=100, max_depth=0, dynamic_crawl=False,
+                 region="Auto", email_limit=None, phone_limit=None, parent=None):
         """
         :param websites: List of starting website URLs.
         :param max_pages: Maximum number of pages to visit per website (0 for unlimited).
         :param max_depth: Maximum depth for crawling links (0 for unlimited).
         :param dynamic_crawl: If True, use dynamic crawling (Playwright) for all pages.
+        :param region: Default region code (or "Auto") for phone number extraction.
+        :param email_limit: Maximum number of emails to collect (None means unlimited).
+        :param phone_limit: Maximum number of phone numbers to collect (None means unlimited).
         """
         super().__init__(parent)
         self.websites = websites
         self.max_pages = max_pages
         self.max_depth = max_depth  # 0 means no depth limit
         self.dynamic_crawl = dynamic_crawl
+        self.default_region = region  # e.g. "Auto", "IT", "US", etc.
+        self.email_limit = email_limit
+        self.phone_limit = phone_limit
         self.stop_requested = False
         self.email_regex = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
-        # Regex for Italian mobile phone numbers (adjust as needed)
-        self.mobile_regex = re.compile(
-            r'\b(?:\+39[-\s]?|0039[-\s]?|0)?3\d{2}[-\s]?\d{3}[-\s]?\d{4}\b'
-        )
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -53,20 +60,55 @@ class CrawlerWorker(QtCore.QThread):
         normalized = parsed._replace(netloc=netloc, fragment="")
         return normalized.geturl()
 
-    def normalize_phone(self, phone):
+    def detect_region_from_url(self, url):
         """
-        Normalize Italian mobile numbers so that different formats become identical.
-        Removes spaces, dashes, and ensures a leading "+39".
+        Try to detect a region code based on the website's TLD.
+        If the TLD is not in our mapping (or ambiguous), fallback to default_region or "US".
         """
-        phone = re.sub(r'[\s\-\(\)]+', '', phone)
-        if phone.startswith("0039"):
-            phone = "+39" + phone[4:]
-        if not phone.startswith("+39"):
-            if phone.startswith("0"):
-                phone = "+39" + phone[1:]
-            else:
-                phone = "+39" + phone
-        return phone
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        parts = netloc.split('.')
+        if len(parts) < 2:
+            return self.default_region if self.default_region != "Auto" else "US"
+        tld = parts[-1].upper()
+        mapping = {
+            "IT": "IT",
+            "UK": "GB",  # .uk sites usually use region code "GB"
+            "US": "US",
+            "FR": "FR",
+            "DE": "DE",
+            "IN": "IN",
+            "ES": "ES",
+            "CN": "CN"
+        }
+        return mapping.get(tld, self.default_region if self.default_region != "Auto" else "US")
+
+    def extract_phone_numbers(self, text, region, website_url):
+        """
+        Extract phone numbers using the phonenumbers library.
+        Only numbers that are mobile (or fixed_line_or_mobile) are kept.
+        :param text: Text to search.
+        :param region: The default region to use (if not "Auto").
+        :param website_url: URL of the website (for auto-detection if region == "Auto").
+        :return: A set of phone numbers formatted in E.164.
+        """
+        numbers_found = set()
+        # If region is "Auto", try to detect based on website TLD.
+        if region == "Auto":
+            detected_region = self.detect_region_from_url(website_url)
+        else:
+            detected_region = region
+
+        try:
+            for match in PhoneNumberMatcher(text, detected_region):
+                phone_num = match.number
+                num_type = number_type(phone_num)
+                if num_type in [PhoneNumberType.MOBILE, PhoneNumberType.FIXED_LINE_OR_MOBILE]:
+                    formatted = phonenumbers.format_number(phone_num, PhoneNumberFormat.E164)
+                    numbers_found.add(formatted)
+        except Exception as e:
+            self.log_signal.emit(f"Error extracting phone numbers: {e}")
+        return numbers_found
 
     def run(self):
         for website in self.websites:
@@ -133,12 +175,13 @@ class CrawlerWorker(QtCore.QThread):
                         continue
                     content = response.text
 
-                # Extract emails and mobile numbers.
+                # Extract emails.
                 found_emails = self.email_regex.findall(content)
                 emails_found.update(found_emails)
-                found_mobiles = self.mobile_regex.findall(content)
-                normalized_mobiles = set(self.normalize_phone(m) for m in found_mobiles)
-                mobiles_found.update(normalized_mobiles)
+
+                # Extract mobile numbers.
+                found_mobiles = self.extract_phone_numbers(content, self.default_region, normalized_current)
+                mobiles_found.update(found_mobiles)
 
                 # Follow internal links.
                 soup = BeautifulSoup(content, "html.parser")
@@ -154,10 +197,18 @@ class CrawlerWorker(QtCore.QThread):
                             queue.append((normalized_link, current_depth + 1))
                 time.sleep(1)  # Polite delay
 
+                # Check if we have reached the desired limits.
+                if (self.email_limit is not None or self.phone_limit is not None):
+                    email_done = (self.email_limit is None or len(emails_found) >= self.email_limit)
+                    phone_done = (self.phone_limit is None or len(mobiles_found) >= self.phone_limit)
+                    if email_done and phone_done:
+                        self.log_signal.emit("Threshold reached for this website. Stopping crawl for this website.")
+                        break
+
             except Exception as e:
                 self.log_signal.emit(f"Error accessing {normalized_current}: {e}")
 
-        # If static crawl (not forced dynamic) returned insufficient data, try a dynamic fallback.
+        # Dynamic fallback: if static crawling yielded insufficient data.
         if not self.dynamic_crawl and (len(emails_found) == 0 or len(mobiles_found) == 0):
             self.log_signal.emit("Static crawling yielded insufficient data; trying dynamic fallback on base URL.")
             try:
@@ -172,7 +223,7 @@ class CrawlerWorker(QtCore.QThread):
                 playwright.stop()
 
                 dynamic_emails = set(self.email_regex.findall(dynamic_content))
-                dynamic_mobiles = set(self.normalize_phone(m) for m in self.mobile_regex.findall(dynamic_content))
+                dynamic_mobiles = set(self.extract_phone_numbers(dynamic_content, self.default_region, base_url))
                 if dynamic_emails:
                     emails_found.update(dynamic_emails)
                 if dynamic_mobiles:
@@ -198,7 +249,8 @@ class CrawlerWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EnP - Advanced Email & Mobile Number Crawler")
+        self.setWindowTitle("EnP")
+        self.setWindowIcon(QtGui.QIcon("EnP.ico"))
         self.resize(1100, 800)
         self.websites = []  # List to hold website URLs.
         self.results = {}   # Dictionary: {website: (emails set, mobiles set)}
@@ -239,9 +291,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bulk_email_button.clicked.connect(self.send_bulk_email)
         control_layout.addWidget(self.bulk_email_button)
 
-        # Checkbox to force dynamic crawling. If unchecked, auto fallback is enabled.
+        # Checkbox to force dynamic crawling.
         self.dynamic_checkbox = QtWidgets.QCheckBox("Force Dynamic Crawling (JS)")
         control_layout.addWidget(self.dynamic_checkbox)
+
+        # Region selection for phone numbers.
+        self.region_label = QtWidgets.QLabel("Phone Region:")
+        control_layout.addWidget(self.region_label)
+        self.region_combo = QtWidgets.QComboBox()
+        self.region_combo.addItems(["Auto", "IT", "US", "GB", "FR", "DE", "IN"])
+        self.region_combo.setToolTip("Select default region for phone number extraction. 'Auto' will try to detect based on website TLD.")
+        control_layout.addWidget(self.region_combo)
+
+        # Email and Phone limits.
+        self.email_limit_label = QtWidgets.QLabel("Max Emails:")
+        control_layout.addWidget(self.email_limit_label)
+        self.email_limit_edit = QtWidgets.QLineEdit()
+        self.email_limit_edit.setPlaceholderText("All")
+        self.email_limit_edit.setFixedWidth(50)
+        control_layout.addWidget(self.email_limit_edit)
+
+        self.phone_limit_label = QtWidgets.QLabel("Max Phones:")
+        control_layout.addWidget(self.phone_limit_label)
+        self.phone_limit_edit = QtWidgets.QLineEdit()
+        self.phone_limit_edit.setPlaceholderText("All")
+        self.phone_limit_edit.setFixedWidth(50)
+        control_layout.addWidget(self.phone_limit_edit)
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 0)
@@ -401,7 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.log("Starting crawling process for new websites...")
-        # Do not clear self.results; preserve previous results.
+        # Preserve previous results.
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.export_button.setEnabled(False)
@@ -410,11 +485,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start(1000)
         self.start_time = time.time()
 
+        # Get the default region from the combo box.
+        region = self.region_combo.currentText()
+
+        # Retrieve the user-specified email and phone limits.
+        email_limit_text = self.email_limit_edit.text().strip()
+        if email_limit_text.isdigit():
+            email_limit = int(email_limit_text)
+        else:
+            email_limit = None
+
+        phone_limit_text = self.phone_limit_edit.text().strip()
+        if phone_limit_text.isdigit():
+            phone_limit = int(phone_limit_text)
+        else:
+            phone_limit = None
+
         self.worker = CrawlerWorker(
             new_sites,
             max_pages=100,
             max_depth=0,
-            dynamic_crawl=self.dynamic_checkbox.isChecked()
+            dynamic_crawl=self.dynamic_checkbox.isChecked(),
+            region=region,
+            email_limit=email_limit,
+            phone_limit=phone_limit
         )
         self.worker.log_signal.connect(self.log)
         self.worker.website_done_signal.connect(self.update_table)
@@ -451,7 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(email_count)))
                 self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(", ".join(emails)))
                 self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(", ".join(mobiles)))
-                # Create a QLabel with clickable WhatsApp links (each on a new line)
+                # Create a QLabel with clickable WhatsApp links.
                 wa_html = ""
                 for m in sorted(mobiles):
                     url = self.get_whatsapp_link(m)
@@ -511,10 +605,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.timer_label.setText(f"Elapsed Time: {hours:02}:{minutes:02}:{seconds:02}")
 
 # ------------------------------------------------------------------------------
-# Main entry point
+# Main entry point with Splash Screen
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
+    # Set the application icon (for taskbar, etc.)
+    app.setWindowIcon(QtGui.QIcon("EnP.ico"))
+
+    # Create and show the splash screen.
+    splash_pix = QtGui.QPixmap("EnP.ico")
+    splash = QtWidgets.QSplashScreen(splash_pix, QtCore.Qt.WindowStaysOnTopHint)
+    splash.setWindowFlag(QtCore.Qt.FramelessWindowHint)
+    splash.showMessage("Developed by Saurav Shriwastav", QtCore.Qt.AlignBottom | QtCore.Qt.AlignCenter, QtCore.Qt.white)
+    splash.show()
+    app.processEvents()
+
+    # (Optional) simulate loading delay if needed.
+    time.sleep(2)
+
+    # Create and show the main window.
     window = MainWindow()
     window.show()
+
+    # Close the splash screen once the main window is ready.
+    splash.finish(window)
+
     sys.exit(app.exec_())
